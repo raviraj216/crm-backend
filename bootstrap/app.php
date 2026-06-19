@@ -18,8 +18,7 @@ return Application::configure(basePath: dirname(__DIR__))
         //
         $middleware->redirectGuestsTo(
             fn () => null
-        );
-    
+        );    
         // $middleware->api(prepend: [
         //     \Laravel\Sanctum\Http\Middleware\EnsureFrontendRequestsAreStateful::class,
         // ]);
