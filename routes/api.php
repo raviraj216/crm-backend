@@ -2,6 +2,10 @@
 
 use Illuminate\Support\Facades\Route;
 use App\Http\Controllers\AuthController;
+use App\Http\Controllers\WebhookController;
+
+Route::get('/webhook', [WebhookController::class, 'verify']);
+Route::post('/webhook', [WebhookController::class, 'receive']);
 
 Route::post('/login',[AuthController::class,'login']);
 
