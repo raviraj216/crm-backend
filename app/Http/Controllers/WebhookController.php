@@ -5,298 +5,313 @@ namespace App\Http\Controllers;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Http;
-use App\Models\Business; 
-use App\Models\WhatsappProduct; 
+use App\Models\Business;
+use App\Models\WhatsappMessage;
 use App\Models\WhatsappConversation;
 
 class WebhookController extends Controller
 {
-    /**
-     * WhatsApp webhook verification
-     */
+    // ─────────────────────────────────────────────────────────────────────
+    // WEBHOOK VERIFICATION
+    // ─────────────────────────────────────────────────────────────────────
+
     public function verify(Request $request)
     {
-        $verifyToken = env('WHATSAPP_VERIFY_TOKEN');
-
         if (
             $request->get('hub_mode') === 'subscribe' &&
-            $request->get('hub_verify_token') === $verifyToken
+            $request->get('hub_verify_token') === env('WHATSAPP_VERIFY_TOKEN')
         ) {
-            return response(
-                $request->get('hub_challenge'),
-                200
-            );
+            return response($request->get('hub_challenge'), 200);
         }
 
         return response('Unauthorized', 403);
     }
 
-    /**
-     * Receive webhook data
-     */
-        // public function receive(Request $request)
-        // {
-        //     try {
+    // ─────────────────────────────────────────────────────────────────────
+    // RECEIVE WEBHOOK
+    // ─────────────────────────────────────────────────────────────────────
 
-        //         $payload = $request->all();
+    public function receive(Request $request)
+    {
+        try {
+            $data  = $request->all();
 
-        //         Log::info('WhatsApp Webhook', $payload);
+            $value = $data['entry'][0]['changes'][0]['value'] ?? [];
 
-        //         $entry = $payload['entry'][0] ?? null;
+            Log::info('Webhook received', $data);
 
-        //         if ($entry) {
+            if (isset($value['statuses'])) {
+                return response()->json(['ignored' => 'status']);
+            }
 
-        //             $changes = $entry['changes'][0] ?? [];
+            if (!isset($value['messages'])) {
+                return response()->json(['ignored' => 'no_messages']);
+            }
 
-        //             $messages = $changes['value']['messages'] ?? [];
+            $phoneNumberId = $value['metadata']['phone_number_id'] ?? null;
+             
+            $business      = Business::where('phone_number_id', $phoneNumberId)->first();
 
-        //             foreach ($messages as $message) {
+            if (!$business) {
+                return response()->json(['ignored' => 'unknown_business']);
+            }
 
-        //                 $from = $message['from'] ?? null;
-
-        //                 $text =
-        //                     $message['text']['body']
-        //                     ?? '';
-
-        //                 Log::info("Message from {$from}: {$text}");
-
-        //                 // Auto reply
-        //                 if ($from) {
-
-        //                     $this->sendWhatsAppMessage(
-        //                         $from,
-        //                         "Thanks! We received: {$text}"
-        //                     );
-        //                 }
-        //             }
-        //         }
-
-        //         return response()->json([
-        //             'success' => true
-        //         ]);
-
-        //     } catch (\Exception $e) {
-
-        //         Log::error($e->getMessage());
-
-        //         return response()->json([
-        //             'success' => false
-        //         ], 500);
-        //     }
-        // }
-
-        public function receive(Request $request)
-        {
-            try {
-
-                $data = $request->all();
-
-                Log::info('Webhook', $data);
-
-                $value =
-                    $data['entry'][0]['changes'][0]['value']
-                    ?? [];
-
-                // Ignore status callbacks
-                if (isset($value['statuses'])) {
-                    return response()->json([
-                        'ignored' => 'status'
-                    ]);
+            foreach ($value['messages'] as $msg) {
+                if (($msg['type'] ?? '') !== 'text') {
+                    continue;
                 }
 
-                // Ignore if no messages
-                if (!isset($value['messages'])) {
-                    return response()->json([
-                        'ignored' => true
-                    ]);
+                $mobile = $msg['from'];
+
+                if ($mobile === $business->phone_number) {
+                    continue;
                 }
 
-                $phoneNumberId =
-                    $value['metadata']['phone_number_id']
-                    ?? null;
+                $text = trim(strtolower($msg['text']['body'] ?? ''));
 
-                $business = Business::where(
-                    'phone_number_id',
-                    $phoneNumberId
-                )->first();
+                $this->processMessage($business, $mobile, $text, $msg['text']['body'] ?? '');
+            }
 
-                if (!$business) {
-                    return response()->json();
+            return response()->json(['success' => true]);
+
+        } catch (\Exception $e) {
+            Log::error('Webhook error: ' . $e->getMessage(), ['trace' => $e->getTraceAsString()]);
+            return response()->json(['error' => true], 500);
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // MAIN PROCESSOR — fully database-driven, no hardcoded logic
+    // ─────────────────────────────────────────────────────────────────────
+
+    private function processMessage(
+        Business $business,
+        string $mobile,
+        string $text,         // lowercased, for matching
+        string $rawText       // original case, for storing in collected_data
+    ): void {
+        $conversation = WhatsappConversation::firstOrCreate(
+            ['business_id' => $business->id, 'mobile' => $mobile],
+            ['current_step' => null, 'collected_data' => null]
+        );
+
+        $conversation->last_message_at = now();
+        $conversation->save();
+
+        // ── 1. Active step takes highest priority ────────────────────────
+        if ($conversation->current_step) {
+            $stepMessage = WhatsappMessage::where('business_id', $business->id)
+                ->where('step', $conversation->current_step)
+                ->where('is_active', true)
+                ->first();
+
+            if ($stepMessage) {
+                // If this step collects data, save the user's raw reply first
+                if ($stepMessage->collect_as) {
+                    $data = (array) ($conversation->collected_data ?? []);
+                    $data[$stepMessage->collect_as] = $rawText;
+                    $conversation->collected_data = $data;
+                    $conversation->save();
                 }
 
-                foreach ($value['messages'] as $msg) {
-
-                    // Only text messages
-                    if (($msg['type'] ?? '') !== 'text') {
-                        continue;
-                    }
-
-                    $mobile = $msg['from'];
-
-                    $text = trim(
-                        strtolower(
-                            $msg['text']['body'] ?? ''
-                        )
-                    );
-
-                    if (isset($msg['from']) && $msg['from'] == $business->phone_number
-                    ) {
-                        continue;
-                    }
-
-                    $this->processMessage(
-                        $business,
-                        $mobile,
-                        $text
-                    );
-                }
-
-                return response()->json([
-                    'success' => true
-                ]);
-
-            } catch (\Exception $e) {
-
-                Log::error($e->getMessage());
-
-                return response()->json([
-                    'error' => true
-                ], 500);
+                $this->sendMessage($business, $mobile, $stepMessage, $conversation);
+                $this->advanceStep($conversation, $stepMessage->next_step);
+                return;
             }
         }
 
-  
-    private function sendMessage($business, $mobile, $message)
+        // ── 2. Keyword matching ──────────────────────────────────────────
+        // Load all active, non-fallback messages for this business that have triggers
+        $keywordMessages = WhatsappMessage::where('business_id', $business->id)
+            ->where('is_active', true)
+            ->where('is_fallback', false)
+            ->whereNotNull('triggers')
+            ->orderByDesc('priority')
+            ->get();
+
+        foreach ($keywordMessages as $message) {
+            if ($this->matchesTrigger($text, $message)) {
+                $this->sendMessage($business, $mobile, $message, $conversation);
+                $this->advanceStep($conversation, $message->next_step);
+                return;
+            }
+        }
+
+        // ── 3. Fallback ──────────────────────────────────────────────────
+        $fallback = WhatsappMessage::where('business_id', $business->id)
+            ->where('is_active', true)
+            ->where('is_fallback', true)
+            ->first();
+
+        if ($fallback) {
+            $this->sendMessage($business, $mobile, $fallback, $conversation);
+            $this->advanceStep($conversation, $fallback->next_step);
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // TRIGGER MATCHING
+    // ─────────────────────────────────────────────────────────────────────
+
+    private function matchesTrigger(string $text, WhatsappMessage $message): bool
+    {
+        $triggers = (array) ($message->triggers ?? []);
+
+        if (empty($triggers)) {
+            return false;
+        }
+
+        foreach ($triggers as $trigger) {
+            $trigger = strtolower(trim($trigger));
+
+            $matched = match ($message->match_mode) {
+                'exact'    => $text === $trigger,
+                'contains' => str_contains($text, $trigger),
+                'starts'   => str_starts_with($text, $trigger),
+                default    => $text === $trigger,
+            };
+
+            if ($matched) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // SEND (routes to text or template)
+    // ─────────────────────────────────────────────────────────────────────
+
+    private function sendMessage(
+        Business $business,
+        string $mobile,
+        WhatsappMessage $message,
+        WhatsappConversation $conversation
+    ): void {
+        if ($message->type === 'template') {
+            $this->sendTemplate($business, $mobile, $message, $conversation);
+        } else {
+            $body = $this->resolvePlaceholders(
+                $message->body ?? '',
+                $business,
+                $conversation
+            );
+            $this->sendTextMessage($business, $mobile, $body);
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // PLACEHOLDER RESOLUTION
+    // Replaces {key} tokens in body with business fields or collected_data
+    // ─────────────────────────────────────────────────────────────────────
+
+    private function resolvePlaceholders(
+        string $body,
+        Business $business,
+        WhatsappConversation $conversation
+    ): string {
+        // Built-in business placeholders
+        $body = str_replace('{business_name}',    $business->name,                             $body);
+        $body = str_replace('{business_contact}', $business->contact ?? $business->phone_number, $body);
+
+        // Dynamic placeholders from collected_data
+        $collected = (array) ($conversation->collected_data ?? []);
+
+        foreach ($collected as $key => $value) {
+            $body = str_replace('{' . $key . '}', $value, $body);
+        }
+
+        return $body;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // ADVANCE STEP
+    // ─────────────────────────────────────────────────────────────────────
+
+    private function advanceStep(WhatsappConversation $conversation, ?string $nextStep): void
+    {
+        $conversation->current_step = $nextStep;
+
+        // Reset collected_data when conversation ends
+        if ($nextStep === null) {
+            $conversation->collected_data = null;
+        }
+
+        $conversation->save();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // SEND TEXT MESSAGE
+    // ─────────────────────────────────────────────────────────────────────
+
+    private function sendTextMessage(Business $business, string $mobile, string $body): void
     {
         $url = "https://graph.facebook.com/v23.0/{$business->phone_number_id}/messages";
 
-        $response = Http::withToken($business->access_token)
-            ->post($url, [
-                'messaging_product' => 'whatsapp',
-                'to' => $mobile,
-                'type' => 'text',
-                'text' => [
-                    'body' => $message,
-                ],
-            ]);
-
-        Log::info('WhatsApp response', [
-            'status' => $response->status(),
-            'body' => $response->json(),
+        $response = Http::withToken($business->access_token)->withOptions([
+        'verify' => false // or full path
+    ])->post($url, [
+            'messaging_product' => 'whatsapp',
+            'to'                => $mobile,
+            'type'              => 'text',
+            'text'              => ['body' => $body],
         ]);
 
-        return $response;
-    }
-    // private function sendWhatsAppMessage($to, $message)
-    // {
-    //     try {
-
-    //         $url = "https://graph.facebook.com/v23.0/"
-    //             . env('WHATSAPP_PHONE_NUMBER_ID')
-    //             . "/messages";
-
-    //         $response = Http::withToken(
-    //             env('WHATSAPP_TOKEN')
-    //         )->post($url, [
-
-    //             'messaging_product' => 'whatsapp',
-
-    //             'to' => $to,
-
-    //             'type' => 'text',
-
-    //             'text' => [
-    //                 'body' => $message
-    //             ]
-
-    //         ]);
-
-    //         Log::info('Send Message Response', [
-    //             'response' => $response->json()
-    //         ]);
-
-    //         return $response->successful();
-
-    //     } catch (\Exception $e) {
-
-    //         Log::error($e->getMessage());
-
-    //         return false;
-    //     }
-    // }
-
-    private function processMessage($business, $mobile, $text)
-    {
-        if (in_array($text, ['hi', 'hello', 'menu'])) {
-            return $this->sendMenu($business, $mobile);
-        }
-
-        if (is_numeric($text)) {
-            return $this->sendProduct($business, $mobile, $text);
-        }
-
-        if (str_contains($text, 'order')) {
-            return $this->sendMessage(
-                $business,
-                $mobile,
-                "Please send:\n\nName\nAddress\nQty"
-            );
-        }
+        Log::info('WhatsApp text sent', [
+            'to'     => $mobile,
+            'status' => $response->status(),
+            'body'   => $response->json(),
+        ]);
     }
 
-    private function sendMenu($business, $mobile)
-    {
-        $products = WhatsappProduct::where(
-            'business_id',
-            $business->id
-        )
-            ->orderBy('serial')
-            ->get();
- 
+    // ─────────────────────────────────────────────────────────────────────
+    // SEND TEMPLATE MESSAGE
+    // template_params is an array of collected_data keys.
+    // Each resolves to {{1}}, {{2}}, ... in the Meta template.
+    // ─────────────────────────────────────────────────────────────────────
 
-        $msg = "Welcome to {$business->name}\n\nProducts:\n\n";
+    private function sendTemplate(
+        Business $business,
+        string $mobile,
+        WhatsappMessage $message,
+        WhatsappConversation $conversation
+    ): void {
+        $paramKeys   = (array) ($message->template_params ?? []);
+        $collected   = (array) ($conversation->collected_data ?? []);
 
-        foreach ($products as $product) {
-            $msg .= "{$product->serial}. {$product->title}\n";
+        $components = [];
+
+        if (!empty($paramKeys)) {
+            $parameters = array_map(fn ($key) => [
+                'type' => 'text',
+                'text' => $collected[$key] ?? '—',
+            ], $paramKeys);
+
+            $components[] = [
+                'type'       => 'body',
+                'parameters' => $parameters,
+            ];
         }
 
-        $msg .= "\nReply number";
- 
-        return $this->sendMessage(
-            $business,
-            $mobile,
-            $msg
-        );
-    }
+        $url = "https://graph.facebook.com/v23.0/{$business->phone_number_id}/messages";
 
-    private function sendProduct($business, $mobile, $number)
-    {
-        $product = WhatsappProduct::where('business_id', $business->id)
-            ->where('serial', $number)
-            ->first();
+        $response = Http::withToken($business->access_token)->post($url, [
+            'messaging_product' => 'whatsapp',
+            'to'                => $mobile,
+            'type'              => 'template',
+            'template'          => [
+                'name'       => $message->template_name,
+                'language'   => ['code' => 'en'],
+                'components' => $components,
+            ],
+        ]);
 
-        if (!$product) {
-            return null;
-        }
-
-        $msg = "
-            {$product->title}
-
-            Price:
-            ₹{$product->price}
-
-            Ingredients:
-            {$product->ingredients}
-
-            Reply:
-            ORDER {$number}
-
-            CONTACT";
-
-        return $this->sendMessage(
-            $business,
-            $mobile,
-            trim($msg)
-        );
+        Log::info('WhatsApp template sent', [
+            'template' => $message->template_name,
+            'to'       => $mobile,
+            'params'   => array_combine($paramKeys, array_column($components[0]['parameters'] ?? [], 'text')),
+            'status'   => $response->status(),
+        ]);
     }
 }
