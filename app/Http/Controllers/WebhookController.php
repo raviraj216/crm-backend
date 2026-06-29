@@ -38,7 +38,7 @@ class WebhookController extends Controller
 
             $value = $data['entry'][0]['changes'][0]['value'] ?? [];
 
-            Log::info('Webhook received', $data);
+           // Log::info('Webhook received', $data);
 
             if (isset($value['statuses'])) {
                 return response()->json(['ignored' => 'status']);
@@ -68,6 +68,8 @@ class WebhookController extends Controller
                 }
 
                 $text = trim(strtolower($msg['text']['body'] ?? ''));
+
+                Log::info('processMessage'.$text, $data);
 
                 $this->processMessage($business, $mobile, $text, $msg['text']['body'] ?? '');
             }
@@ -292,6 +294,31 @@ class WebhookController extends Controller
                 'type'       => 'body',
                 'parameters' => $parameters,
             ];
+
+            /*just for order template*/
+            $components[] = [
+                'type' => 'button',
+                'sub_type' => 'copy_code',
+                'index' => '1',
+                'parameters' => [
+                    [
+                        'type' => 'payload',
+                        'payload' => 'TEST50'
+                    ]
+                ]
+            ];
+            $components[] = [
+                        'type' => 'header',
+                        'parameters' => [
+                            [
+                                'type' => 'image',
+                                'image' => [
+                                'link' => 'https://purple-seal-824227.hostingersite.com/backend/public/logo.png'
+                                ]
+                            ]
+                        ]
+                    ];
+            /*just for order template*/
         }
 
         $url = "https://graph.facebook.com/v23.0/{$business->phone_number_id}/messages";
@@ -314,4 +341,71 @@ class WebhookController extends Controller
             'status'   => $response->status(),
         ]);
     }
+
+
+
+    public function testTemplate()
+{
+    $business = Business::find(1);
+
+    $url = "https://graph.facebook.com/v23.0/{$business->phone_number_id}/messages";
+
+    $response = Http::withToken($business->access_token)
+        ->post($url, [
+            'messaging_product' => 'whatsapp',
+            'to' => '919977112260',
+            'type' => 'template',
+            'template' => [
+                'name' => 'order_confirmation',
+                'language' => [
+                    'code' => 'en'
+                ],
+                'components' => [
+                    [
+                        'type' => 'button',
+                        'sub_type' => 'copy_code',
+                        'index' => '1',
+                        'parameters' => [
+                            [
+                                'type' => 'payload',
+                                'payload' => 'TEST50'
+                            ]
+                        ]
+                    ],
+                    [
+                        'type' => 'header',
+                        'parameters' => [
+                            [
+                                'type' => 'image',
+                                'image' => [
+                                'link' => 'https://purple-seal-824227.hostingersite.com/backend/public/logo.png'
+                                ]
+                            ]
+                        ]
+                    ],
+                    [
+                        'type' => 'body',
+                        'parameters' => [
+                            [
+                                'type' => 'text',
+                                'text' => 'John'
+                            ],
+                            [
+                                'type' => 'text',
+                                'text' => '2'
+                            ],
+                            [
+                                'type' => 'text',
+                                'text' => 'LIG'
+                            ]
+                        ]
+                    ]
+                ]
+            ]
+        ]);
+
+    return $response->json();
+}
+
+
 }
